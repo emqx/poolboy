@@ -1,6 +1,4 @@
-# Poolboy - A hunky Erlang worker pool factory
-
-[![Build Status](https://api.travis-ci.org/devinus/poolboy.svg?branch=master)](https://travis-ci.org/devinus/poolboy)
+# Poolboy - A hunky Erlang worker pool factory [![Build status](https://github.com/emqx/poolboy/actions/workflows/main.yml/badge.svg)](https://github.com/emqx/poolboy/actions/workflows/main.yml)
 
 [![Support via Gratipay](https://cdn.rawgit.com/gratipay/gratipay-badge/2.3.0/dist/gratipay.png)](https://gratipay.com/devinus/)
 
