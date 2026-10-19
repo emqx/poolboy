@@ -46,8 +46,9 @@
     max_overflow = 10 :: non_neg_integer(),
     strategy = lifo :: lifo | fifo,
     overflow_ttl = 0 :: non_neg_integer(),
-    overflow_check_period = undefined :: undefined | pos_integer(),
+    overflow_check_period = undefined :: undefined | non_neg_integer(),
     idle_since = #{} :: #{pid() => integer()},
+    reaper = undefined :: undefined | {pid(), reference()},
     overflow_timer = undefined :: undefined | reference()
 }).
 
@@ -170,7 +171,7 @@ init([{overflow_ttl, TTL} | Rest], WorkerArgs, State)
   when is_integer(TTL), TTL >= 0 ->
     init(Rest, WorkerArgs, State#state{overflow_ttl = TTL});
 init([{overflow_check_period, Period} | Rest], WorkerArgs, State)
-  when is_integer(Period), Period > 0 ->
+  when is_integer(Period), Period >= 0 ->
     init(Rest, WorkerArgs, State#state{overflow_check_period = Period});
 init([{overflow_ttl, Value} | _], _WorkerArgs, _State) ->
     {stop, {invalid_option, {overflow_ttl, Value}}};
@@ -268,6 +269,14 @@ handle_call(_Msg, _From, State) ->
     Reply = {error, invalid_message},
     {reply, Reply, State}.
 
+handle_info({overflow_reaped, Reaper, Pid}, State = #state{reaper = {Reaper, _Ref}}) ->
+    State1 = handle_worker_exit(Pid, State),
+    Reaper ! {reap_next, self()},
+    {noreply, State1};
+handle_info({'DOWN', Ref, process, Reaper, normal}, State = #state{reaper = {Reaper, Ref}}) ->
+    {noreply, State#state{reaper = undefined}};
+handle_info({'DOWN', Ref, process, Reaper, Reason}, State = #state{reaper = {Reaper, Ref}}) ->
+    {stop, {overflow_reaper_failed, Reason}, State#state{reaper = undefined}};
 handle_info({'DOWN', MRef, _, _, _}, State) ->
     case ets:match(State#state.monitors, {'$1', '_', MRef}) of
         [[Pid]] ->
@@ -311,6 +320,10 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
+    case State#state.reaper of
+        undefined -> ok;
+        {Reaper, _} -> exit(Reaper, kill)
+    end,
     case State#state.overflow_timer of
         undefined -> ok;
         Ref -> erlang:cancel_timer(Ref)
@@ -319,13 +332,6 @@ terminate(_Reason, State) ->
     true = exit(State#state.supervisor, shutdown),
     ok.
 
-code_change(_OldVsn, State, _Extra) when tuple_size(State) =:= 9 ->
-    Workers = case element(3, State) of
-        List when is_list(List) -> queue:from_list(List);
-        Queue -> Queue
-    end,
-    State1 = setelement(3, State, Workers),
-    {ok, list_to_tuple(tuple_to_list(State1) ++ [0, undefined, #{}, undefined])};
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
@@ -436,6 +442,7 @@ start_overflow_timer(State = #state{overflow_ttl = 0}) ->
 start_overflow_timer(State = #state{overflow_ttl = TTL, overflow_check_period = Period}) ->
     Delay = case Period of
         undefined -> erlang:min(TTL, 1000);
+        0 -> erlang:min(TTL, 1000);
         _ -> Period
     end,
     Ref = erlang:start_timer(Delay, self(), reap_overflow),
@@ -443,18 +450,33 @@ start_overflow_timer(State = #state{overflow_ttl = TTL, overflow_check_period = 
 
 reap_overflow(State = #state{overflow = 0}) ->
     State;
+reap_overflow(State = #state{reaper = Reaper}) when Reaper =/= undefined ->
+    State;
 reap_overflow(State = #state{workers = Workers, overflow = Overflow,
-                             overflow_ttl = TTL, supervisor = Sup, idle_since = Idle}) ->
+                             overflow_ttl = TTL, idle_since = Idle}) ->
     Now = idle_time(),
-    {Remaining, Kept, NewIdle} = lists:foldl(
-        fun(Pid, {N, Acc, Times}) ->
+    {_Remaining, Kept, Expired, NewIdle} = lists:foldl(
+        fun(Pid, {N, Acc, Retiring, Times}) ->
             case maps:find(Pid, Times) of
                 {ok, Since} when N > 0, Now - Since >= TTL ->
-                    ok = dismiss_worker(Sup, Pid),
-                    {N - 1, Acc, maps:remove(Pid, Times)};
+                    true = unlink(Pid),
+                    {N - 1, Acc, [Pid | Retiring], maps:remove(Pid, Times)};
                 _ ->
-                    {N, [Pid | Acc], Times}
+                    {N, [Pid | Acc], Retiring, Times}
             end
-        end, {Overflow, [], Idle}, queue:to_list(Workers)),
+        end, {Overflow, [], [], Idle}, queue:to_list(Workers)),
     NewWorkers = queue:from_list(lists:reverse(Kept)),
-    State#state{workers = NewWorkers, overflow = Remaining, idle_since = NewIdle}.
+    start_reaper(lists:reverse(Expired), State#state{workers = NewWorkers, idle_since = NewIdle}).
+
+start_reaper([], State) ->
+    State;
+start_reaper(Workers, State = #state{supervisor = Sup}) ->
+    Pool = self(),
+    Reaper = spawn_opt(fun() ->
+        lists:foreach(fun(Pid) ->
+            ok = supervisor:terminate_child(Sup, Pid),
+            Pool ! {overflow_reaped, self(), Pid},
+            receive {reap_next, Pool} -> ok end
+        end, Workers)
+    end, [link, monitor]),
+    State#state{reaper = Reaper}.

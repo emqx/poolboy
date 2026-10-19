@@ -157,11 +157,16 @@ code_change(_OldVsn, State, _Extra) ->
   Defaults to `0`, which removes excess workers immediately on check-in when
   nobody is waiting. A positive value retains idle workers for reuse; checked-out
   workers are never reaped, and the pool never shrinks below `size`.
-- `overflow_check_period`: positive interval in milliseconds between idle-worker
-  checks. Defaults to the smaller of `overflow_ttl` and 1000 milliseconds when
-  TTL is enabled. Expired workers are removed on the next check, so actual idle
-  retention can exceed the TTL by one check period (plus scheduling delay).
+- `overflow_check_period`: interval in milliseconds between idle-worker
+  checks. A value of `0` selects the default interval. Defaults to the smaller
+  of `overflow_ttl` and 1000 milliseconds when TTL is enabled. Expired workers
+  leave the available pool on the next check, so idle retention can exceed the
+  TTL by one check period (plus scheduling delay). Shutdown completion may take
+  longer when workers close slowly.
   This option has no effect when `overflow_ttl` is `0`.
+  Expired workers are closed by a background process so slow shutdowns do not
+  block borrowing an available worker. Closing workers still count toward
+  `max_overflow` until they have terminated.
 - `strategy`: `lifo` or `fifo`, determines whether checked in workers should be
   placed first or last in the line of available workers. So, `lifo` operates like a traditional stack; `fifo` like a queue. Default is `lifo`.
 

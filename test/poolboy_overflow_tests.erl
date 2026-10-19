@@ -18,7 +18,7 @@ retention(Strategy) ->
             checkin(Pool, B),
             await(fun() -> not is_process_alive(B) end),
             ?assert(is_process_alive(A)),
-            ?assertEqual({overflow, 0, 0, 1}, poolboy:status(Pool)),
+            await_status(Pool, {overflow, 0, 0, 1}),
             checkin(Pool, A)
         end).
 
@@ -28,7 +28,7 @@ immediate_reaping_test_() ->
         B = poolboy:checkout(Pool),
         checkin(Pool, B),
         await(fun() -> not is_process_alive(B) end),
-        ?assertEqual({overflow, 0, 0, 1}, poolboy:status(Pool)),
+        await_status(Pool, {overflow, 0, 0, 1}),
         checkin(Pool, A)
     end) end} || {Name, Opts} <- [{"default", []}, {"zero", [{overflow_ttl, 0}]}]].
 
@@ -43,7 +43,7 @@ lifo_reaping_test() ->
         reap_now(Pool),
         await(fun() -> not is_process_alive(A) end),
         ?assert(is_process_alive(B)),
-        ?assertEqual({ready, 1, 0, 0}, poolboy:status(Pool))
+        await_status(Pool, {ready, 1, 0, 0})
     end).
 
 idle_timeout_resets_test() ->
@@ -112,7 +112,7 @@ borrower_exit_test() ->
         Owner ! stop,
         receive {'DOWN', Ref, process, Owner, normal} -> ok after 1000 -> error(timeout) end,
         await(fun() -> not is_process_alive(B) end),
-        ?assertEqual({overflow, 0, 0, 1}, poolboy:status(Pool)),
+        await_status(Pool, {overflow, 0, 0, 1}),
         checkin(Pool, A)
     end).
 
@@ -146,7 +146,7 @@ checkout_timeout_test() ->
         ?assertExit({timeout, _}, poolboy:checkout(Pool, true, 10)),
         checkin(Pool, B),
         await(fun() -> not is_process_alive(B) end),
-        ?assertEqual({overflow, 0, 0, 1}, poolboy:status(Pool)),
+        await_status(Pool, {overflow, 0, 0, 1}),
         checkin(Pool, A)
     end).
 
@@ -158,27 +158,6 @@ stop_test() ->
     checkin(Pool, B),
     ok = poolboy:stop(Pool),
     await(fun() -> not is_process_alive(A) andalso not is_process_alive(B) end).
-
-legacy_state_test_() ->
-    [{Name, fun() -> legacy_state(Representation) end}
-     || {Name, Representation} <- [{"1.5.2 list", list}, {"master queue", queue}]].
-
-legacy_state(Representation) ->
-    with_pool([], fun(Pool) ->
-        State = sys:get_state(Pool),
-        Legacy0 = list_to_tuple(lists:sublist(tuple_to_list(State), 9)),
-        Legacy = case Representation of
-            list -> setelement(3, Legacy0, queue:to_list(element(3, Legacy0)));
-            queue -> Legacy0
-        end,
-        ok = sys:suspend(Pool),
-        sys:replace_state(Pool, fun(_) -> Legacy end),
-        ok = sys:change_code(Pool, poolboy, "1.5.2", []),
-        ok = sys:resume(Pool),
-        ?assertEqual({ready, 1, 0, 0}, poolboy:status(Pool)),
-        Worker = poolboy:checkout(Pool),
-        checkin(Pool, Worker)
-    end).
 
 checked_out_worker_exit_test() ->
     with_pool([{overflow_ttl, 1000}], fun(Pool) ->
@@ -213,7 +192,144 @@ invalid_options_test_() ->
         ?assertEqual({error, {invalid_option, Option}},
             poolboy:start([Option, {worker_module, poolboy_test_worker}]))
     end} || Option <- [{overflow_ttl, -1}, {overflow_ttl, invalid},
-                       {overflow_check_period, 0}, {overflow_check_period, -1}]].
+                       {overflow_check_period, -1}]].
+
+zero_check_period_test_() ->
+    [{Name, fun() -> with_pool(Options, fun(Pool) ->
+        A = poolboy:checkout(Pool),
+        B = poolboy:checkout(Pool),
+        checkin(Pool, B),
+        case TTL of
+            0 -> await(fun() -> not is_process_alive(B) end);
+            _ ->
+                ?assert(is_process_alive(B)),
+                await(fun() -> not is_process_alive(B) end)
+        end,
+        checkin(Pool, A)
+    end) end} || {Name, TTL, Options} <- [
+        {"disabled TTL, period first", 0,
+            [{overflow_check_period, 0}, {overflow_ttl, 0}]},
+        {"disabled TTL, TTL first", 0,
+            [{overflow_ttl, 0}, {overflow_check_period, 0}]},
+        {"enabled TTL, period first", 50,
+            [{overflow_check_period, 0}, {overflow_ttl, 50}]},
+        {"enabled TTL, TTL first", 50,
+            [{overflow_ttl, 50}, {overflow_check_period, 0}]}]].
+
+slow_shutdown_does_not_block_checkout_test() ->
+    {ok, Pool} = poolboy:start_link([{worker_module, poolboy_shutdown_worker},
+        {size, 1}, {max_overflow, 3}, {overflow_ttl, 20},
+        {overflow_check_period, 50}], [{test_parent, self()}]),
+    Workers = [poolboy:checkout(Pool) || _ <- lists:seq(1, 4)],
+    try
+        [checkin(Pool, W) || W <- Workers],
+        Closing = receive {shutdown_started, W0} -> W0
+                  after 1000 -> error(no_shutdown) end,
+        %% A worker deliberately blocks in terminate/2 while idle capacity exists.
+        Available = poolboy:checkout(Pool, true, 100),
+        ?assert(Available =/= Closing),
+        ?assertEqual({full, 0, 3, 1}, poolboy:status(Pool)),
+        ?assertEqual(full, poolboy:checkout(Pool, false)),
+        checkin(Pool, Available),
+        Closing ! finish_shutdown,
+        [receive {shutdown_started, W1} -> W1 ! finish_shutdown
+         after 1000 -> error(no_shutdown) end || _ <- lists:seq(1, 2)],
+        await(fun() -> poolboy:status(Pool) =:= {ready, 1, 0, 0} end)
+    after
+        [exit(W, kill) || W <- Workers],
+        catch poolboy:stop(Pool)
+    end.
+
+waiting_during_shutdown_test() ->
+    {ok, Pool} = poolboy:start_link([{worker_module, poolboy_shutdown_worker},
+        {size, 1}, {max_overflow, 3}, {overflow_ttl, 20},
+        {overflow_check_period, 50}], [{test_parent, self()}]),
+    A = poolboy:checkout(Pool),
+    B = poolboy:checkout(Pool),
+    D = poolboy:checkout(Pool),
+    E = poolboy:checkout(Pool),
+    checkin(Pool, B),
+    checkin(Pool, D),
+    checkin(Pool, E),
+    receive {shutdown_started, B} -> ok after 1000 -> error(no_shutdown) end,
+    Parent = self(),
+    {Owner, Ref} = spawn_monitor(fun() ->
+        poolboy:transaction(Pool, fun(W) ->
+            Parent ! {borrowed_after_shutdown, W},
+            receive release -> ok end
+        end)
+    end),
+    try
+        %% The reaper, current borrower, and waiting borrower are all monitored.
+        await(fun() -> length(element(2, process_info(Pool, monitors))) =:= 3 end),
+        B ! finish_shutdown,
+        C = receive {borrowed_after_shutdown, Worker} -> Worker
+            after 1000 -> error(waiter_not_woken) end,
+        ?assert(is_process_alive(C)),
+        ?assert(C =/= B),
+        ?assertEqual({full, 0, 3, 2}, poolboy:status(Pool)),
+        exit(C, kill),
+        Owner ! release,
+        receive {'DOWN', Ref, process, Owner, normal} -> ok
+        after 1000 -> error(borrower_not_stopped) end,
+        [receive {shutdown_started, W} -> W ! finish_shutdown
+         after 1000 -> error(no_shutdown) end || _ <- lists:seq(1, 2)],
+        await_status(Pool, {overflow, 0, 0, 1})
+    after
+        exit(Owner, kill),
+        exit(A, kill),
+        exit(B, kill),
+        exit(D, kill),
+        exit(E, kill),
+        catch poolboy:stop(Pool)
+    end.
+
+stop_during_shutdown_test() ->
+    {ok, Pool} = poolboy:start_link([{worker_module, poolboy_shutdown_worker},
+        {size, 1}, {max_overflow, 1}, {overflow_ttl, 20},
+        {overflow_check_period, 50}], [{test_parent, self()}]),
+    A = poolboy:checkout(Pool),
+    B = poolboy:checkout(Pool),
+    try
+        checkin(Pool, A),
+        checkin(Pool, B),
+        Closing = receive {shutdown_started, Worker} -> Worker
+                  after 1000 -> error(no_shutdown) end,
+        [{process, Reaper}] = element(2, process_info(Pool, monitors)),
+        ?assert(is_process_alive(Reaper)),
+        ok = poolboy:stop(Pool),
+        await(fun() -> not is_process_alive(Reaper) end),
+        Closing ! finish_shutdown
+    after
+        exit(A, kill),
+        exit(B, kill),
+        catch poolboy:stop(Pool)
+    end.
+
+killed_pool_stops_reaper_test() ->
+    {ok, Pool} = poolboy:start([{worker_module, poolboy_shutdown_worker},
+        {size, 1}, {max_overflow, 1}, {overflow_ttl, 20},
+        {overflow_check_period, 50}], [{test_parent, self()}]),
+    A = poolboy:checkout(Pool),
+    B = poolboy:checkout(Pool),
+    checkin(Pool, B),
+    receive {shutdown_started, B} -> ok after 1000 -> error(no_shutdown) end,
+    [Reaper] = [P || {process, P} <- element(2, process_info(Pool, monitors)), P =/= self()],
+    try
+        %% Hold the pool before it can acknowledge the completed shutdown.
+        ok = sys:suspend(Pool),
+        B ! finish_shutdown,
+        await(fun() -> lists:member({overflow_reaped, Reaper, B},
+            element(2, process_info(Pool, messages))) end),
+        exit(Pool, kill),
+        await(fun() -> not is_process_alive(Pool) end),
+        await(fun() -> not is_process_alive(Reaper) end)
+    after
+        exit(Pool, kill),
+        exit(Reaper, kill),
+        exit(A, kill),
+        exit(B, kill)
+    end.
 
 start_pool(Options) ->
     poolboy:start_link([{worker_module, poolboy_test_worker}, {size, 1},
@@ -236,6 +352,9 @@ reap_now(Pool) ->
     Pool ! {timeout, Ref, reap_overflow},
     _ = poolboy:status(Pool),
     ok.
+
+await_status(Pool, Status) ->
+    await(fun() -> poolboy:status(Pool) =:= Status end).
 
 await(Predicate) ->
     await(Predicate, erlang:monotonic_time(millisecond) + 2000).
