@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.5.2-emqx.1 (unreleased)
+## Git tag 1.5.2-emqx.1 (unreleased)
 
 - Add `overflow_ttl` and `overflow_check_period`, both in milliseconds, to
   retain idle excess workers between bursts and reap them after their idle TTL.
@@ -17,4 +17,5 @@
   the new options. Hot upgrades must invoke state migration or restart pools;
   loading the new module alone does not migrate running state.
 
-This version extends the EMQX fork. The existing `1.5.2` tag remains unchanged.
+This tag extends the EMQX fork. The application version remains `1.5.2`, and
+`VERSION` retains its existing value. The existing `1.5.2` tag remains unchanged.
