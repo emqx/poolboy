@@ -187,7 +187,7 @@ init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
         0 -> #{};
         _ -> maps:from_list([{Pid, idle_time()} || Pid <- queue:to_list(Workers)])
     end,
-    {ok, start_overflow_timer(State#state{workers = Workers, idle_since = Idle})}.
+    {ok, update_overflow_timer(State#state{workers = Workers, idle_since = Idle})}.
 
 handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     case ets:lookup(Monitors, Pid) of
@@ -232,8 +232,9 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
         {{value, Pid},  Left} ->
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{workers = Left,
-                                   idle_since = maps:remove(Pid, State#state.idle_since)}};
+            State1 = State#state{workers = Left,
+                                 idle_since = maps:remove(Pid, State#state.idle_since)},
+            {reply, Pid, update_overflow_timer(State1)};
         {empty, _Left} when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, MRef} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
@@ -274,7 +275,7 @@ handle_info({overflow_reaped, Reaper, Pid}, State = #state{reaper = {Reaper, _Re
     Reaper ! {reap_next, self()},
     {noreply, State1};
 handle_info({'DOWN', Ref, process, Reaper, normal}, State = #state{reaper = {Reaper, Ref}}) ->
-    {noreply, State#state{reaper = undefined}};
+    {noreply, update_overflow_timer(State#state{reaper = undefined})};
 handle_info({'DOWN', Ref, process, Reaper, Reason}, State = #state{reaper = {Reaper, Ref}}) ->
     {stop, {overflow_reaper_failed, Reason}, State#state{reaper = undefined}};
 handle_info({'DOWN', MRef, _, _, _}, State) ->
@@ -304,7 +305,7 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
                         idle_since = maps:remove(Pid, State#state.idle_since)},
                     case State#state.overflow of
                         N when N > 0 ->
-                            {noreply, State1#state{overflow = N - 1}};
+                            {noreply, update_overflow_timer(State1#state{overflow = N - 1})};
                         _ ->
                             {noreply, return_idle_worker(new_worker(Sup), State1)}
                     end;
@@ -314,8 +315,8 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
     end;
 
 handle_info({timeout, Ref, reap_overflow}, State = #state{overflow_timer = Ref}) ->
-    State1 = reap_overflow(State),
-    {noreply, start_overflow_timer(State1#state{overflow_timer = undefined})};
+    State1 = reap_overflow(State#state{overflow_timer = undefined}),
+    {noreply, update_overflow_timer(State1)};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -405,7 +406,7 @@ handle_worker_exit(_Pid, State) ->
             gen_server:reply(From, NewWorker),
             State#state{waiting = LeftWaiting};
         {empty, Empty} when Overflow > 0 ->
-            State#state{overflow = Overflow - 1, waiting = Empty};
+            update_overflow_timer(State#state{overflow = Overflow - 1, waiting = Empty});
         {empty, Empty} ->
             return_idle_worker(new_worker(Sup), State#state{waiting = Empty})
     end.
@@ -427,7 +428,7 @@ state_name(_State) ->
 
 return_idle_worker(Pid, State = #state{workers = Workers}) ->
     NewWorkers = queue:in(Pid, Workers),
-    remember_idle_worker(Pid, State#state{workers = NewWorkers}).
+    update_overflow_timer(remember_idle_worker(Pid, State#state{workers = NewWorkers})).
 
 remember_idle_worker(_Pid, State = #state{overflow_ttl = 0}) ->
     State;
@@ -437,9 +438,27 @@ remember_idle_worker(Pid, State = #state{idle_since = Idle}) ->
 idle_time() ->
     erlang:monotonic_time(millisecond).
 
-start_overflow_timer(State = #state{overflow_ttl = 0}) ->
+update_overflow_timer(State = #state{overflow_ttl = 0}) ->
+    cancel_overflow_timer(State);
+update_overflow_timer(State = #state{overflow = 0}) ->
+    cancel_overflow_timer(State);
+update_overflow_timer(State = #state{reaper = Reaper}) when Reaper =/= undefined ->
+    cancel_overflow_timer(State);
+update_overflow_timer(State = #state{workers = Workers}) ->
+    case queue:is_empty(Workers) of
+        true -> cancel_overflow_timer(State);
+        false -> ensure_overflow_timer(State)
+    end.
+
+cancel_overflow_timer(State = #state{overflow_timer = undefined}) ->
     State;
-start_overflow_timer(State = #state{overflow_ttl = TTL, overflow_check_period = Period}) ->
+cancel_overflow_timer(State = #state{overflow_timer = Ref}) ->
+    erlang:cancel_timer(Ref),
+    State#state{overflow_timer = undefined}.
+
+ensure_overflow_timer(State = #state{overflow_timer = Ref}) when is_reference(Ref) ->
+    State;
+ensure_overflow_timer(State = #state{overflow_ttl = TTL, overflow_check_period = Period}) ->
     Delay = case Period of
         undefined -> erlang:min(TTL, 1000);
         0 -> erlang:min(TTL, 1000);

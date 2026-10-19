@@ -159,11 +159,12 @@ code_change(_OldVsn, State, _Extra) ->
   workers are never reaped, and the pool never shrinks below `size`.
 - `overflow_check_period`: interval in milliseconds between idle-worker
   checks. A value of `0` selects the default interval. Defaults to the smaller
-  of `overflow_ttl` and 1000 milliseconds when TTL is enabled. Expired workers
-  leave the available pool on the next check, so idle retention can exceed the
-  TTL by one check period (plus scheduling delay). Shutdown completion may take
-  longer when workers close slowly.
-  This option has no effect when `overflow_ttl` is `0`.
+  of `overflow_ttl` and 1000 milliseconds when TTL is enabled. TTL is the minimum
+  idle age for reaping, not an upper bound on retention. Checks and shutdowns may
+  be delayed by scheduling or an earlier batch of slow-closing workers.
+  The timer runs only while there are idle workers and excess capacity to reap,
+  and pauses while a shutdown batch is in progress. This option has no effect
+  when `overflow_ttl` is `0`.
   Expired workers are closed by a background process so slow shutdowns do not
   block borrowing an available worker. Closing workers still count toward
   `max_overflow` until they have terminated.

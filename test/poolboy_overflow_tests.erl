@@ -93,7 +93,10 @@ idle_worker_exit_test() ->
         await(fun() -> poolboy:status(Pool) =:= {overflow, 0, 0, 1} end),
         checkin(Pool, A),
         exit(A, kill),
-        await(fun() -> poolboy:status(Pool) =:= {ready, 1, 0, 0} end),
+        await(fun() ->
+            poolboy:status(Pool) =:= {ready, 1, 0, 0} andalso
+                not queue:member(A, gen_server:call(Pool, get_avail_workers))
+        end),
         C = poolboy:checkout(Pool),
         ?assert(is_process_alive(C)),
         ?assert(C =/= A),
@@ -330,6 +333,83 @@ killed_pool_stops_reaper_test() ->
         exit(A, kill),
         exit(B, kill)
     end.
+
+idle_overflow_timer_lifecycle_test() ->
+    with_pool([{overflow_ttl, 80}, {overflow_check_period, 100}], fun(Pool) ->
+        ?assertEqual(undefined, overflow_timer(Pool)),
+        A = poolboy:checkout(Pool),
+        B = poolboy:checkout(Pool),
+        ?assertEqual(undefined, overflow_timer(Pool)),
+        checkin(Pool, B),
+        OldRef = overflow_timer(Pool),
+        ?assert(is_reference(OldRef)),
+        ?assertEqual(B, poolboy:checkout(Pool)),
+        ?assertEqual(undefined, overflow_timer(Pool)),
+        checkin(Pool, B),
+        NewRef = overflow_timer(Pool),
+        ?assert(is_reference(NewRef)),
+        ?assert(OldRef =/= NewRef),
+        Pool ! {timeout, OldRef, reap_overflow},
+        ?assertEqual(NewRef, overflow_timer(Pool)),
+        await_status(Pool, {overflow, 0, 0, 1}),
+        ?assertEqual(undefined, overflow_timer(Pool)),
+        checkin(Pool, A),
+        ?assertEqual(undefined, overflow_timer(Pool))
+    end).
+
+no_overflow_timer_test_() ->
+    [{Name, fun() -> with_pool(Options, fun(Pool) ->
+        ?assertEqual(undefined, overflow_timer(Pool)),
+        A = poolboy:checkout(Pool),
+        checkin(Pool, A),
+        ?assertEqual(undefined, overflow_timer(Pool))
+    end) end} || {Name, Options} <- [
+        {"TTL disabled", [{overflow_ttl, 0}, {overflow_check_period, 1}]},
+        {"overflow disabled", [{overflow_ttl, 10}, {max_overflow, 0}]}]].
+
+timer_resumes_after_reaping_test() ->
+    {ok, Pool} = poolboy:start_link([{worker_module, poolboy_shutdown_worker},
+        {size, 1}, {max_overflow, 2}, {overflow_ttl, 40},
+        {overflow_check_period, 10}], [{test_parent, self()}]),
+    A = poolboy:checkout(Pool),
+    B = poolboy:checkout(Pool),
+    C = poolboy:checkout(Pool),
+    checkin(Pool, B),
+    checkin(Pool, C),
+    receive {shutdown_started, B} -> ok after 1000 -> error(no_shutdown) end,
+    Parent = self(),
+    {Owner, Ref} = spawn_monitor(fun() ->
+        Worker = poolboy:checkout(Pool),
+        poolboy:checkin(Pool, Worker),
+        Parent ! {returned_during_reaping, Worker}
+    end),
+    try
+        await(fun() -> length(element(2, process_info(Pool, monitors))) =:= 3 end),
+        B ! finish_shutdown,
+        D = receive {returned_during_reaping, Worker} -> Worker
+            after 1000 -> error(no_replacement) end,
+        receive {'DOWN', Ref, process, Owner, normal} -> ok
+        after 1000 -> error(owner_not_stopped) end,
+        receive {shutdown_started, C} -> ok after 1000 -> error(no_shutdown) end,
+        await_status(Pool, {ready, 1, 2, 1}),
+        ?assertEqual(undefined, overflow_timer(Pool)),
+        C ! finish_shutdown,
+        receive {shutdown_started, D} -> D ! finish_shutdown
+        after 1000 -> error(timer_not_resumed) end,
+        await_status(Pool, {overflow, 0, 0, 1}),
+        ?assertEqual(undefined, overflow_timer(Pool)),
+        checkin(Pool, A)
+    after
+        exit(Owner, kill),
+        catch poolboy:stop(Pool),
+        exit(A, kill),
+        exit(B, kill),
+        exit(C, kill)
+    end.
+
+overflow_timer(Pool) ->
+    State = sys:get_state(Pool),
+    element(tuple_size(State), State).
 
 start_pool(Options) ->
     poolboy:start_link([{worker_module, poolboy_test_worker}, {size, 1},
