@@ -4,8 +4,8 @@
 -behaviour(gen_server).
 
 -export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
-         transaction/3, child_spec/2, child_spec/3, start/1, start/2,
-         start_link/1, start_link/2, stop/1, status/1]).
+         transaction/3, child_spec/2, child_spec/3, child_spec/4, start/1,
+         start/2, start_link/1, start_link/2, stop/1, status/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 -export_type([pool/0]).
@@ -38,7 +38,7 @@
 
 -record(state, {
     supervisor :: undefined | pid(),
-    workers = [] :: [pid()],
+    workers :: undefined | pid_queue(),
     waiting :: pid_queue(),
     monitors :: ets:tid(),
     size = 5 :: non_neg_integer(),
@@ -100,8 +100,23 @@ child_spec(PoolId, PoolArgs) ->
                  WorkerArgs :: proplists:proplist())
     -> supervisor:child_spec().
 child_spec(PoolId, PoolArgs, WorkerArgs) ->
+    child_spec(PoolId, PoolArgs, WorkerArgs, tuple).
+
+-spec child_spec(PoolId :: term(),
+                 PoolArgs :: proplists:proplist(),
+                 WorkerArgs :: proplists:proplist(),
+                 ChildSpecFormat :: 'tuple' | 'map')
+    -> supervisor:child_spec().
+child_spec(PoolId, PoolArgs, WorkerArgs, tuple) ->
     {PoolId, {poolboy, start_link, [PoolArgs, WorkerArgs]},
-     permanent, 5000, worker, [poolboy]}.
+     permanent, 5000, worker, [poolboy]};
+child_spec(PoolId, PoolArgs, WorkerArgs, map) ->
+    #{id => PoolId,
+      start => {poolboy, start_link, [PoolArgs, WorkerArgs]},
+      restart => permanent,
+      shutdown => 5000,
+      type => worker,
+      modules => [poolboy]}.
 
 -spec start(PoolArgs :: proplists:proplist())
     -> start_ret().
@@ -169,7 +184,7 @@ init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
     Workers = prepopulate(Size, Sup),
     Idle = case State#state.overflow_ttl of
         0 -> #{};
-        _ -> maps:from_list([{Pid, idle_time()} || Pid <- Workers])
+        _ -> maps:from_list([{Pid, idle_time()} || Pid <- queue:to_list(Workers)])
     end,
     {ok, start_overflow_timer(State#state{workers = Workers, idle_since = Idle})}.
 
@@ -210,20 +225,21 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
            workers = Workers,
            monitors = Monitors,
            overflow = Overflow,
-           max_overflow = MaxOverflow} = State,
-    case Workers of
-        [Pid | Left] ->
+           max_overflow = MaxOverflow,
+           strategy = Strategy} = State,
+    case get_worker_with_strategy(Workers, Strategy) of
+        {{value, Pid},  Left} ->
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             {reply, Pid, State#state{workers = Left,
                                    idle_since = maps:remove(Pid, State#state.idle_since)}};
-        [] when MaxOverflow > 0, Overflow < MaxOverflow ->
+        {empty, _Left} when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, MRef} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             {reply, Pid, State#state{overflow = Overflow + 1}};
-        [] when Block =:= false ->
+        {empty, _Left} when Block =:= false ->
             {reply, full, State};
-        [] ->
+        {empty, _Left} ->
             MRef = erlang:monitor(process, FromPid),
             Waiting = queue:in({From, CRef, MRef}, State#state.waiting),
             {noreply, State#state{waiting = Waiting}}
@@ -234,7 +250,7 @@ handle_call(status, _From, State) ->
            monitors = Monitors,
            overflow = Overflow} = State,
     StateName = state_name(State),
-    {reply, {StateName, length(Workers), Overflow, ets:info(Monitors, size)}, State};
+    {reply, {StateName, queue:len(Workers), Overflow, ets:info(Monitors, size)}, State};
 handle_call(get_avail_workers, _From, State) ->
     Workers = State#state.workers,
     {reply, Workers, State};
@@ -272,9 +288,9 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             NewState = handle_worker_exit(Pid, State),
             {noreply, NewState};
         [] ->
-            case lists:member(Pid, State#state.workers) of
+            case queue:member(Pid, State#state.workers) of
                 true ->
-                    W = lists:filter(fun (P) -> P =/= Pid end, State#state.workers),
+                    W = filter_worker_by_pid(Pid, State#state.workers),
                     State1 = State#state{workers = W,
                         idle_since = maps:remove(Pid, State#state.idle_since)},
                     case State#state.overflow of
@@ -299,12 +315,17 @@ terminate(_Reason, State) ->
         undefined -> ok;
         Ref -> erlang:cancel_timer(Ref)
     end,
-    ok = lists:foreach(fun (W) -> unlink(W) end, State#state.workers),
+    ok = lists:foreach(fun (W) -> unlink(W) end, queue:to_list(State#state.workers)),
     true = exit(State#state.supervisor, shutdown),
     ok.
 
 code_change(_OldVsn, State, _Extra) when tuple_size(State) =:= 9 ->
-    {ok, list_to_tuple(tuple_to_list(State) ++ [0, undefined, #{}, undefined])};
+    Workers = case element(3, State) of
+        List when is_list(List) -> queue:from_list(List);
+        Queue -> Queue
+    end,
+    State1 = setelement(3, State, Workers),
+    {ok, list_to_tuple(tuple_to_list(State1) ++ [0, undefined, #{}, undefined])};
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
@@ -326,19 +347,27 @@ new_worker(Sup, FromPid) ->
     Ref = erlang:monitor(process, FromPid),
     {Pid, Ref}.
 
+get_worker_with_strategy(Workers, fifo) ->
+    queue:out(Workers);
+get_worker_with_strategy(Workers, lifo) ->
+    queue:out_r(Workers).
+
 dismiss_worker(Sup, Pid) ->
     true = unlink(Pid),
     supervisor:terminate_child(Sup, Pid).
 
+filter_worker_by_pid(Pid, Workers) ->
+    queue:filter(fun (WPid) -> WPid =/= Pid end, Workers).
+
 prepopulate(N, _Sup) when N < 1 ->
-    [];
+    queue:new();
 prepopulate(N, Sup) ->
-    prepopulate(N, Sup, []).
+    prepopulate(N, Sup, queue:new()).
 
 prepopulate(0, _Sup, Workers) ->
     Workers;
 prepopulate(N, Sup, Workers) ->
-    prepopulate(N-1, Sup, [new_worker(Sup) | Workers]).
+    prepopulate(N-1, Sup, queue:in(new_worker(Sup), Workers)).
 
 handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
@@ -359,7 +388,7 @@ handle_checkin(Pid, State) ->
             return_idle_worker(Pid, State#state{waiting = Empty})
     end.
 
-handle_worker_exit(Pid, State) ->
+handle_worker_exit(_Pid, State) ->
     #state{supervisor = Sup,
            monitors = Monitors,
            overflow = Overflow} = State,
@@ -372,31 +401,26 @@ handle_worker_exit(Pid, State) ->
         {empty, Empty} when Overflow > 0 ->
             State#state{overflow = Overflow - 1, waiting = Empty};
         {empty, Empty} ->
-            Workers =
-                [new_worker(Sup)
-                 | lists:filter(fun (P) -> P =/= Pid end, State#state.workers)],
-            remember_idle_worker(hd(Workers), State#state{workers = Workers, waiting = Empty})
+            return_idle_worker(new_worker(Sup), State#state{waiting = Empty})
     end.
 
 state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
     #state{max_overflow = MaxOverflow, workers = Workers} = State,
-    case length(Workers) == 0 of
+    case queue:len(Workers) == 0 of
         true when MaxOverflow < 1 -> full;
         true -> overflow;
         false -> ready
     end;
-state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow, workers = []}) ->
-    full;
-state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
-    ready;
+state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow, workers = Workers}) ->
+    case queue:is_empty(Workers) of
+        true -> full;
+        false -> ready
+    end;
 state_name(_State) ->
     overflow.
 
-return_idle_worker(Pid, State = #state{workers = Workers, strategy = Strategy}) ->
-    NewWorkers = case Strategy of
-        lifo -> [Pid | Workers];
-        fifo -> Workers ++ [Pid]
-    end,
+return_idle_worker(Pid, State = #state{workers = Workers}) ->
+    NewWorkers = queue:in(Pid, Workers),
     remember_idle_worker(Pid, State#state{workers = NewWorkers}).
 
 remember_idle_worker(_Pid, State = #state{overflow_ttl = 0}) ->
@@ -431,6 +455,6 @@ reap_overflow(State = #state{workers = Workers, overflow = Overflow,
                 _ ->
                     {N, [Pid | Acc], Times}
             end
-        end, {Overflow, [], Idle}, Workers),
-    NewWorkers = lists:reverse(Kept),
+        end, {Overflow, [], Idle}, queue:to_list(Workers)),
+    NewWorkers = queue:from_list(lists:reverse(Kept)),
     State#state{workers = NewWorkers, overflow = Remaining, idle_since = NewIdle}.

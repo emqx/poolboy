@@ -159,10 +159,18 @@ stop_test() ->
     ok = poolboy:stop(Pool),
     await(fun() -> not is_process_alive(A) andalso not is_process_alive(B) end).
 
-legacy_state_test() ->
+legacy_state_test_() ->
+    [{Name, fun() -> legacy_state(Representation) end}
+     || {Name, Representation} <- [{"1.5.2 list", list}, {"master queue", queue}]].
+
+legacy_state(Representation) ->
     with_pool([], fun(Pool) ->
         State = sys:get_state(Pool),
-        Legacy = list_to_tuple(lists:sublist(tuple_to_list(State), 9)),
+        Legacy0 = list_to_tuple(lists:sublist(tuple_to_list(State), 9)),
+        Legacy = case Representation of
+            list -> setelement(3, Legacy0, queue:to_list(element(3, Legacy0)));
+            queue -> Legacy0
+        end,
         ok = sys:suspend(Pool),
         sys:replace_state(Pool, fun(_) -> Legacy end),
         ok = sys:change_code(Pool, poolboy, "1.5.2", []),
@@ -171,6 +179,41 @@ legacy_state_test() ->
         Worker = poolboy:checkout(Pool),
         checkin(Pool, Worker)
     end).
+
+checked_out_worker_exit_test() ->
+    with_pool([{overflow_ttl, 1000}], fun(Pool) ->
+        A = poolboy:checkout(Pool),
+        B = poolboy:checkout(Pool),
+        exit(B, kill),
+        await(fun() -> poolboy:status(Pool) =:= {overflow, 0, 0, 1} end),
+        exit(A, kill),
+        await(fun() -> poolboy:status(Pool) =:= {ready, 1, 0, 0} end)
+    end).
+
+pool_size_bounds_test_() ->
+    [{Name, fun() ->
+        {ok, Pool} = poolboy:start_link([{worker_module, poolboy_test_worker},
+            {size, Size}, {max_overflow, Max}, {overflow_ttl, 30},
+            {overflow_check_period, 10}]),
+        try
+            Workers = [poolboy:checkout(Pool) || _ <- lists:seq(1, Size + Max)],
+            [checkin(Pool, W) || W <- Workers],
+            await(fun() ->
+                {_, Available, Overflow, Busy} = poolboy:status(Pool),
+                Available =:= Size andalso Overflow =:= 0 andalso Busy =:= 0
+            end),
+            ?assertEqual(Size, length([W || W <- Workers, is_process_alive(W)]))
+        after poolboy:stop(Pool) end
+    end} || {Name, Size, Max} <- [{"multiple excess workers", 2, 3},
+                                {"zero base size", 0, 2},
+                                {"overflow disabled", 2, 0}]].
+
+invalid_options_test_() ->
+    [{lists:flatten(io_lib:format("~p", [Option])), fun() ->
+        ?assertEqual({error, {invalid_option, Option}},
+            poolboy:start([Option, {worker_module, poolboy_test_worker}]))
+    end} || Option <- [{overflow_ttl, -1}, {overflow_ttl, invalid},
+                       {overflow_check_period, 0}, {overflow_check_period, -1}]].
 
 start_pool(Options) ->
     poolboy:start_link([{worker_module, poolboy_test_worker}, {size, 1},
