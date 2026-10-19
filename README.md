@@ -155,6 +155,15 @@ code_change(_OldVsn, State, _Extra) ->
 - `worker_module`: the module that represents the workers
 - `size`: maximum pool size
 - `max_overflow`: maximum number of workers created if pool is empty
+- `overflow_ttl`: idle time in milliseconds before excess workers may be removed.
+  Defaults to `0`, which removes excess workers immediately on check-in when
+  nobody is waiting. A positive value retains idle workers for reuse; checked-out
+  workers are never reaped, and the pool never shrinks below `size`.
+- `overflow_check_period`: positive interval in milliseconds between idle-worker
+  checks. Defaults to the smaller of `overflow_ttl` and 1000 milliseconds when
+  TTL is enabled. Expired workers are removed on the next check, so actual idle
+  retention can exceed the TTL by one check period (plus scheduling delay).
+  This option has no effect when `overflow_ttl` is `0`.
 - `strategy`: `lifo` or `fifo`, determines whether checked in workers should be
   placed first or last in the line of available workers. So, `lifo` operates like a traditional stack; `fifo` like a queue. Default is `lifo`.
 

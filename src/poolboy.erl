@@ -44,7 +44,11 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo,
+    overflow_ttl = 0 :: non_neg_integer(),
+    overflow_check_period = undefined :: undefined | pos_integer(),
+    idle_since = #{} :: #{pid() => integer()},
+    overflow_timer = undefined :: undefined | reference()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -147,11 +151,27 @@ init([{strategy, lifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = lifo});
 init([{strategy, fifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = fifo});
+init([{overflow_ttl, TTL} | Rest], WorkerArgs, State)
+  when is_integer(TTL), TTL >= 0 ->
+    init(Rest, WorkerArgs, State#state{overflow_ttl = TTL});
+init([{overflow_check_period, Period} | Rest], WorkerArgs, State)
+  when is_integer(Period), Period > 0 ->
+    init(Rest, WorkerArgs, State#state{overflow_check_period = Period});
+init([{overflow_ttl, Value} | _], _WorkerArgs, _State) ->
+    {stop, {invalid_option, {overflow_ttl, Value}}};
+init([{overflow_check_period, undefined} | Rest], WorkerArgs, State) ->
+    init(Rest, WorkerArgs, State);
+init([{overflow_check_period, Value} | _], _WorkerArgs, _State) ->
+    {stop, {invalid_option, {overflow_check_period, Value}}};
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
     Workers = prepopulate(Size, Sup),
-    {ok, State#state{workers = Workers}}.
+    Idle = case State#state.overflow_ttl of
+        0 -> #{};
+        _ -> maps:from_list([{Pid, idle_time()} || Pid <- Workers])
+    end,
+    {ok, start_overflow_timer(State#state{workers = Workers, idle_since = Idle})}.
 
 handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     case ets:lookup(Monitors, Pid) of
@@ -195,7 +215,8 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
         [Pid | Left] ->
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{workers = Left}};
+            {reply, Pid, State#state{workers = Left,
+                                   idle_since = maps:remove(Pid, State#state.idle_since)}};
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, MRef} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
@@ -254,20 +275,36 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case lists:member(Pid, State#state.workers) of
                 true ->
                     W = lists:filter(fun (P) -> P =/= Pid end, State#state.workers),
-                    {noreply, State#state{workers = [new_worker(Sup) | W]}};
+                    State1 = State#state{workers = W,
+                        idle_since = maps:remove(Pid, State#state.idle_since)},
+                    case State#state.overflow of
+                        N when N > 0 ->
+                            {noreply, State1#state{overflow = N - 1}};
+                        _ ->
+                            {noreply, return_idle_worker(new_worker(Sup), State1)}
+                    end;
                 false ->
                     {noreply, State}
             end
     end;
 
+handle_info({timeout, Ref, reap_overflow}, State = #state{overflow_timer = Ref}) ->
+    State1 = reap_overflow(State),
+    {noreply, start_overflow_timer(State1#state{overflow_timer = undefined})};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
+    case State#state.overflow_timer of
+        undefined -> ok;
+        Ref -> erlang:cancel_timer(Ref)
+    end,
     ok = lists:foreach(fun (W) -> unlink(W) end, State#state.workers),
     true = exit(State#state.supervisor, shutdown),
     ok.
 
+code_change(_OldVsn, State, _Extra) when tuple_size(State) =:= 9 ->
+    {ok, list_to_tuple(tuple_to_list(State) ++ [0, undefined, #{}, undefined])};
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
@@ -307,22 +344,19 @@ handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
            waiting = Waiting,
            monitors = Monitors,
-           overflow = Overflow,
-           strategy = Strategy} = State,
+           overflow = Overflow} = State,
     case queue:out(Waiting) of
         {{value, {From, CRef, MRef}}, Left} ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
+        {empty, Empty} when Overflow > 0, State#state.overflow_ttl > 0 ->
+            return_idle_worker(Pid, State#state{waiting = Empty});
         {empty, Empty} when Overflow > 0 ->
             ok = dismiss_worker(Sup, Pid),
             State#state{waiting = Empty, overflow = Overflow - 1};
         {empty, Empty} ->
-            Workers = case Strategy of
-                lifo -> [Pid | State#state.workers];
-                fifo -> State#state.workers ++ [Pid]
-            end,
-            State#state{workers = Workers, waiting = Empty, overflow = 0}
+            return_idle_worker(Pid, State#state{waiting = Empty})
     end.
 
 handle_worker_exit(Pid, State) ->
@@ -341,7 +375,7 @@ handle_worker_exit(Pid, State) ->
             Workers =
                 [new_worker(Sup)
                  | lists:filter(fun (P) -> P =/= Pid end, State#state.workers)],
-            State#state{workers = Workers, waiting = Empty}
+            remember_idle_worker(hd(Workers), State#state{workers = Workers, waiting = Empty})
     end.
 
 state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
@@ -351,7 +385,52 @@ state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
         true -> overflow;
         false -> ready
     end;
-state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
+state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow, workers = []}) ->
     full;
+state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
+    ready;
 state_name(_State) ->
     overflow.
+
+return_idle_worker(Pid, State = #state{workers = Workers, strategy = Strategy}) ->
+    NewWorkers = case Strategy of
+        lifo -> [Pid | Workers];
+        fifo -> Workers ++ [Pid]
+    end,
+    remember_idle_worker(Pid, State#state{workers = NewWorkers}).
+
+remember_idle_worker(_Pid, State = #state{overflow_ttl = 0}) ->
+    State;
+remember_idle_worker(Pid, State = #state{idle_since = Idle}) ->
+    State#state{idle_since = maps:put(Pid, idle_time(), Idle)}.
+
+idle_time() ->
+    erlang:monotonic_time(millisecond).
+
+start_overflow_timer(State = #state{overflow_ttl = 0}) ->
+    State;
+start_overflow_timer(State = #state{overflow_ttl = TTL, overflow_check_period = Period}) ->
+    Delay = case Period of
+        undefined -> erlang:min(TTL, 1000);
+        _ -> Period
+    end,
+    Ref = erlang:start_timer(Delay, self(), reap_overflow),
+    State#state{overflow_timer = Ref}.
+
+reap_overflow(State = #state{overflow = 0}) ->
+    State;
+reap_overflow(State = #state{workers = Workers, overflow = Overflow,
+                             overflow_ttl = TTL, supervisor = Sup, idle_since = Idle}) ->
+    Now = idle_time(),
+    {Remaining, Kept, NewIdle} = lists:foldl(
+        fun(Pid, {N, Acc, Times}) ->
+            case maps:find(Pid, Times) of
+                {ok, Since} when N > 0, Now - Since >= TTL ->
+                    ok = dismiss_worker(Sup, Pid),
+                    {N - 1, Acc, maps:remove(Pid, Times)};
+                _ ->
+                    {N, [Pid | Acc], Times}
+            end
+        end, {Overflow, [], Idle}, Workers),
+    NewWorkers = lists:reverse(Kept),
+    State#state{workers = NewWorkers, overflow = Remaining, idle_since = NewIdle}.
