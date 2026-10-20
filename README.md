@@ -167,7 +167,10 @@ code_change(_OldVsn, State, _Extra) ->
   when `overflow_ttl` is `0`.
   Expired workers are closed by a background process so slow shutdowns do not
   block borrowing an available worker. Closing workers still count toward
-  `max_overflow` until they have terminated.
+  `max_overflow` until they have terminated. While the supervisor is closing a
+  worker, creation and replacement are deferred. Blocking checkouts can still
+  receive returned workers. If none are available, non-blocking checkouts return
+  `full` and pool status reports `full`, even if there is spare overflow capacity.
 - `strategy`: `lifo` or `fifo`, determines whether checked in workers should be
   placed first or last in the line of available workers. So, `lifo` operates like a traditional stack; `fifo` like a queue. Default is `lifo`.
 

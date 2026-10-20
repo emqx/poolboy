@@ -411,6 +411,118 @@ overflow_timer(Pool) ->
     State = sys:get_state(Pool),
     element(tuple_size(State), State).
 
+checkout_below_limit_during_shutdown_test() ->
+    {ok, Pool} = poolboy:start_link([{worker_module, poolboy_shutdown_worker},
+        {size, 1}, {max_overflow, 2}, {overflow_ttl, 20},
+        {overflow_check_period, 10}], [{test_parent, self()}]),
+    A = poolboy:checkout(Pool),
+    B = poolboy:checkout(Pool),
+    checkin(Pool, B),
+    receive {shutdown_started, B} -> ok after 1000 -> error(no_shutdown) end,
+    Parent = self(),
+    {Owner, Ref} = spawn_monitor(fun() ->
+        poolboy:transaction(Pool, fun(W) ->
+            Parent ! {borrowed_below_limit, W},
+            receive release -> ok end
+        end, 1000)
+    end),
+    try
+        await(fun() -> length(element(2, process_info(Pool, monitors))) =:= 3 end),
+        ?assertEqual({full, 0, 1, 1}, gen_server:call(Pool, status, 100)),
+        ?assertEqual(full, poolboy:checkout(Pool, false, 100)),
+        checkin(Pool, A),
+        receive {borrowed_below_limit, A} -> ok
+        after 500 -> error(checkin_not_processed) end,
+        Owner ! release,
+        receive {'DOWN', Ref, process, Owner, normal} -> ok
+        after 1000 -> error(owner_not_done) end,
+        B ! finish_shutdown,
+        await_status(Pool, {ready, 1, 0, 0})
+    after
+        exit(Owner, kill),
+        exit(A, kill), exit(B, kill),
+        catch poolboy:stop(Pool)
+    end.
+
+replacement_during_shutdown_test_() ->
+    [{atom_to_list(Mode), fun() -> replacement_during_shutdown(Mode) end}
+     || Mode <- [borrowed, idle]].
+
+replacement_during_shutdown(Mode) ->
+    {ok, Pool} = poolboy:start_link([{worker_module, poolboy_shutdown_worker},
+        {size, 2}, {max_overflow, 1}, {overflow_ttl, 20},
+        {overflow_check_period, 10}], [{test_parent, self()}]),
+    A = poolboy:checkout(Pool),
+    B = poolboy:checkout(Pool),
+    C = poolboy:checkout(Pool),
+    checkin(Pool, C),
+    receive {shutdown_started, C} -> ok after 1000 -> error(no_shutdown) end,
+    try
+        %% Losing two workers requires restoring the base pool, while
+        %% the supervisor is still busy terminating C.
+        case Mode of
+            borrowed -> ok;
+            idle -> checkin(Pool, B)
+        end,
+        exit(A, kill),
+        case Mode of
+            borrowed -> await_status(Pool, {full, 0, 0, 1});
+            idle -> await_status(Pool, {ready, 1, 0, 0})
+        end,
+        exit(B, kill),
+        await_status(Pool, {full, 0, 0, 0}),
+        ?assertEqual({full, 0, 0, 0}, gen_server:call(Pool, status, 100)),
+        C ! finish_shutdown,
+        await_status(Pool, {ready, 2, 0, 0}),
+        D = poolboy:checkout(Pool),
+        E = poolboy:checkout(Pool),
+        ?assert(is_process_alive(D)), ?assert(is_process_alive(E)),
+        ?assert(D =/= E),
+        checkin(Pool, D), checkin(Pool, E)
+    after
+        exit(A, kill), exit(B, kill), exit(C, kill),
+        catch poolboy:stop(Pool)
+    end.
+
+cancel_deferred_checkout_test_() ->
+    [{atom_to_list(Mode), fun() -> cancel_deferred_checkout(Mode) end}
+     || Mode <- [timeout, owner_exit]].
+
+cancel_deferred_checkout(Mode) ->
+    {ok, Pool} = poolboy:start_link([{worker_module, poolboy_shutdown_worker},
+        {size, 1}, {max_overflow, 2}, {overflow_ttl, 20},
+        {overflow_check_period, 10}], [{test_parent, self()}]),
+    A = poolboy:checkout(Pool),
+    B = poolboy:checkout(Pool),
+    checkin(Pool, B),
+    receive {shutdown_started, B} -> ok after 1000 -> error(no_shutdown) end,
+    Parent = self(),
+    {Owner, Ref} = spawn_monitor(fun() ->
+        Result = catch poolboy:checkout(Pool, true, 200),
+        Parent ! {cancelled_during_shutdown, self(), Result},
+        receive stop -> ok end
+    end),
+    try
+        await(fun() -> length(element(2, process_info(Pool, monitors))) =:= 3 end),
+        case Mode of
+            timeout ->
+                receive {cancelled_during_shutdown, Owner, {'EXIT', {timeout, _}}} -> ok
+                after 1000 -> error(no_timeout) end;
+            owner_exit ->
+                exit(Owner, kill),
+                receive {'DOWN', Ref, process, Owner, killed} -> ok
+                after 1000 -> error(owner_not_done) end
+        end,
+        await(fun() -> length(element(2, process_info(Pool, monitors))) =:= 2 end),
+        B ! finish_shutdown,
+        await_status(Pool, {overflow, 0, 0, 1}),
+        ?assertEqual(1, length(gen_server:call(Pool, get_all_workers)))
+    after
+        exit(Owner, kill),
+        exit(A, kill), exit(B, kill),
+        catch poolboy:stop(Pool)
+    end.
+
 start_pool(Options) ->
     poolboy:start_link([{worker_module, poolboy_test_worker}, {size, 1},
                         {max_overflow, 1} | Options]).
