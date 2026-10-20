@@ -44,7 +44,13 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    strategy = lifo :: lifo | fifo,
+    overflow_ttl = 0 :: non_neg_integer(),
+    overflow_check_period = undefined :: undefined | non_neg_integer(),
+    idle_since = #{} :: #{pid() => integer()},
+    reaper = undefined :: undefined | {pid(), reference()},
+    pending_base = 0 :: non_neg_integer(),
+    overflow_timer = undefined :: undefined | reference()
 }).
 
 -spec checkout(Pool :: pool()) -> pid().
@@ -162,11 +168,27 @@ init([{strategy, lifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = lifo});
 init([{strategy, fifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = fifo});
+init([{overflow_ttl, TTL} | Rest], WorkerArgs, State)
+  when is_integer(TTL), TTL >= 0 ->
+    init(Rest, WorkerArgs, State#state{overflow_ttl = TTL});
+init([{overflow_check_period, Period} | Rest], WorkerArgs, State)
+  when is_integer(Period), Period >= 0 ->
+    init(Rest, WorkerArgs, State#state{overflow_check_period = Period});
+init([{overflow_ttl, Value} | _], _WorkerArgs, _State) ->
+    {stop, {invalid_option, {overflow_ttl, Value}}};
+init([{overflow_check_period, undefined} | Rest], WorkerArgs, State) ->
+    init(Rest, WorkerArgs, State);
+init([{overflow_check_period, Value} | _], _WorkerArgs, _State) ->
+    {stop, {invalid_option, {overflow_check_period, Value}}};
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
 init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
     Workers = prepopulate(Size, Sup),
-    {ok, State#state{workers = Workers}}.
+    Idle = case State#state.overflow_ttl of
+        0 -> #{};
+        _ -> maps:from_list([{Pid, idle_time()} || Pid <- queue:to_list(Workers)])
+    end,
+    {ok, update_overflow_timer(State#state{workers = Workers, idle_since = Idle})}.
 
 handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
     case ets:lookup(Monitors, Pid) of
@@ -211,8 +233,11 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
         {{value, Pid},  Left} ->
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{workers = Left}};
-        {empty, _Left} when MaxOverflow > 0, Overflow < MaxOverflow ->
+            State1 = State#state{workers = Left,
+                                 idle_since = maps:remove(Pid, State#state.idle_since)},
+            {reply, Pid, update_overflow_timer(State1)};
+        {empty, _Left} when MaxOverflow > 0, Overflow < MaxOverflow,
+                           State#state.reaper =:= undefined ->
             {Pid, MRef} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             {reply, Pid, State#state{overflow = Overflow + 1}};
@@ -247,6 +272,15 @@ handle_call(_Msg, _From, State) ->
     Reply = {error, invalid_message},
     {reply, Reply, State}.
 
+handle_info({overflow_reaped, Reaper, _Pid}, State = #state{reaper = {Reaper, _Ref}}) ->
+    %% The reaper waits for our acknowledgement, leaving the supervisor free to create workers.
+    State1 = restore_workers(account_worker_exit(State)),
+    Reaper ! {reap_next, self()},
+    {noreply, State1};
+handle_info({'DOWN', Ref, process, Reaper, normal}, State = #state{reaper = {Reaper, Ref}}) ->
+    {noreply, restore_workers(State#state{reaper = undefined})};
+handle_info({'DOWN', Ref, process, Reaper, Reason}, State = #state{reaper = {Reaper, Ref}}) ->
+    {stop, {overflow_reaper_failed, Reason}, State#state{reaper = undefined}};
 handle_info({'DOWN', MRef, _, _, _}, State) ->
     case ets:match(State#state.monitors, {'$1', '_', MRef}) of
         [[Pid]] ->
@@ -258,8 +292,7 @@ handle_info({'DOWN', MRef, _, _, _}, State) ->
             {noreply, State#state{waiting = Waiting}}
     end;
 handle_info({'EXIT', Pid, _Reason}, State) ->
-    #state{supervisor = Sup,
-           monitors = Monitors} = State,
+    #state{monitors = Monitors} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, _, MRef}] ->
             true = erlang:demonitor(MRef),
@@ -270,18 +303,30 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case queue:member(Pid, State#state.workers) of
                 true ->
                     W = filter_worker_by_pid(Pid, State#state.workers),
-                    {noreply, State#state{workers = queue:in(new_worker(Sup), W)}};
+                    State1 = State#state{workers = W,
+                        idle_since = maps:remove(Pid, State#state.idle_since)},
+                    {noreply, handle_worker_exit(Pid, State1)};
                 false ->
                     {noreply, State}
             end
     end;
 
+handle_info({timeout, Ref, reap_overflow}, State = #state{overflow_timer = Ref}) ->
+    State1 = reap_overflow(State#state{overflow_timer = undefined}),
+    {noreply, update_overflow_timer(State1)};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
-    Workers = queue:to_list(State#state.workers),
-    ok = lists:foreach(fun (W) -> unlink(W) end, Workers),
+    case State#state.reaper of
+        undefined -> ok;
+        {Reaper, _} -> exit(Reaper, kill)
+    end,
+    case State#state.overflow_timer of
+        undefined -> ok;
+        Ref -> erlang:cancel_timer(Ref)
+    end,
+    ok = lists:foreach(fun (W) -> unlink(W) end, queue:to_list(State#state.workers)),
     true = exit(State#state.supervisor, shutdown),
     ok.
 
@@ -338,32 +383,51 @@ handle_checkin(Pid, State) ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
+        {empty, Empty} when Overflow > 0, State#state.overflow_ttl > 0 ->
+            return_idle_worker(Pid, State#state{waiting = Empty});
         {empty, Empty} when Overflow > 0 ->
             ok = dismiss_worker(Sup, Pid),
             State#state{waiting = Empty, overflow = Overflow - 1};
         {empty, Empty} ->
-            Workers = queue:in(Pid, State#state.workers),
-            State#state{workers = Workers, waiting = Empty, overflow = 0}
+            return_idle_worker(Pid, State#state{waiting = Empty})
     end.
 
-handle_worker_exit(Pid, State) ->
-    #state{supervisor = Sup,
-           monitors = Monitors,
-           overflow = Overflow} = State,
-    case queue:out(State#state.waiting) of
-        {{value, {From, CRef, MRef}}, LeftWaiting} ->
-            NewWorker = new_worker(State#state.supervisor),
-            true = ets:insert(Monitors, {NewWorker, CRef, MRef}),
-            gen_server:reply(From, NewWorker),
-            State#state{waiting = LeftWaiting};
-        {empty, Empty} when Overflow > 0 ->
-            State#state{overflow = Overflow - 1, waiting = Empty};
-        {empty, Empty} ->
-            W = filter_worker_by_pid(Pid, State#state.workers),
-            Workers = queue:in(new_worker(Sup), W),
-            State#state{workers = Workers, waiting = Empty}
+handle_worker_exit(_Pid, State) ->
+    State1 = account_worker_exit(State),
+    case State#state.reaper of
+        undefined -> restore_workers(State1);
+        _ -> update_overflow_timer(State1)
     end.
 
+account_worker_exit(State = #state{overflow = Overflow}) when Overflow > 0 ->
+    State#state{overflow = Overflow - 1};
+account_worker_exit(State = #state{pending_base = Pending}) ->
+    State#state{pending_base = Pending + 1}.
+
+restore_workers(State = #state{pending_base = Pending, supervisor = Sup}) when Pending > 0 ->
+    Worker = new_worker(Sup),
+    State1 = handle_checkin(Worker, State#state{pending_base = Pending - 1}),
+    restore_workers(State1);
+restore_workers(State = #state{overflow = Overflow, max_overflow = MaxOverflow,
+                               supervisor = Sup, waiting = Waiting, monitors = Monitors})
+  when Overflow < MaxOverflow ->
+    case queue:out(Waiting) of
+        {{value, {From, CRef, MRef}}, Left} ->
+            Worker = new_worker(Sup),
+            true = ets:insert(Monitors, {Worker, CRef, MRef}),
+            gen_server:reply(From, Worker),
+            restore_workers(State#state{waiting = Left, overflow = Overflow + 1});
+        {empty, _} ->
+            update_overflow_timer(State)
+    end;
+restore_workers(State) ->
+    update_overflow_timer(State).
+
+state_name(State = #state{reaper = Reaper, workers = Workers}) when Reaper =/= undefined ->
+    case queue:is_empty(Workers) of
+        true -> full;
+        false -> state_name(State#state{reaper = undefined})
+    end;
 state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
     #state{max_overflow = MaxOverflow, workers = Workers} = State,
     case queue:len(Workers) == 0 of
@@ -371,7 +435,84 @@ state_name(State = #state{overflow = Overflow}) when Overflow < 1 ->
         true -> overflow;
         false -> ready
     end;
-state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow}) ->
-    full;
+state_name(#state{overflow = MaxOverflow, max_overflow = MaxOverflow, workers = Workers}) ->
+    case queue:is_empty(Workers) of
+        true -> full;
+        false -> ready
+    end;
 state_name(_State) ->
     overflow.
+
+return_idle_worker(Pid, State = #state{workers = Workers}) ->
+    NewWorkers = queue:in(Pid, Workers),
+    update_overflow_timer(remember_idle_worker(Pid, State#state{workers = NewWorkers})).
+
+remember_idle_worker(_Pid, State = #state{overflow_ttl = 0}) ->
+    State;
+remember_idle_worker(Pid, State = #state{idle_since = Idle}) ->
+    State#state{idle_since = maps:put(Pid, idle_time(), Idle)}.
+
+idle_time() ->
+    erlang:monotonic_time(millisecond).
+
+update_overflow_timer(State = #state{overflow_ttl = 0}) ->
+    cancel_overflow_timer(State);
+update_overflow_timer(State = #state{overflow = 0}) ->
+    cancel_overflow_timer(State);
+update_overflow_timer(State = #state{reaper = Reaper}) when Reaper =/= undefined ->
+    cancel_overflow_timer(State);
+update_overflow_timer(State = #state{workers = Workers}) ->
+    case queue:is_empty(Workers) of
+        true -> cancel_overflow_timer(State);
+        false -> ensure_overflow_timer(State)
+    end.
+
+cancel_overflow_timer(State = #state{overflow_timer = undefined}) ->
+    State;
+cancel_overflow_timer(State = #state{overflow_timer = Ref}) ->
+    erlang:cancel_timer(Ref),
+    State#state{overflow_timer = undefined}.
+
+ensure_overflow_timer(State = #state{overflow_timer = Ref}) when is_reference(Ref) ->
+    State;
+ensure_overflow_timer(State = #state{overflow_ttl = TTL, overflow_check_period = Period}) ->
+    Delay = case Period of
+        undefined -> erlang:min(TTL, 1000);
+        0 -> erlang:min(TTL, 1000);
+        _ -> Period
+    end,
+    Ref = erlang:start_timer(Delay, self(), reap_overflow),
+    State#state{overflow_timer = Ref}.
+
+reap_overflow(State = #state{overflow = 0}) ->
+    State;
+reap_overflow(State = #state{reaper = Reaper}) when Reaper =/= undefined ->
+    State;
+reap_overflow(State = #state{workers = Workers, overflow = Overflow,
+                             overflow_ttl = TTL, idle_since = Idle}) ->
+    Now = idle_time(),
+    {_Remaining, Kept, Expired, NewIdle} = lists:foldl(
+        fun(Pid, {N, Acc, Retiring, Times}) ->
+            case maps:find(Pid, Times) of
+                {ok, Since} when N > 0, Now - Since >= TTL ->
+                    true = unlink(Pid),
+                    {N - 1, Acc, [Pid | Retiring], maps:remove(Pid, Times)};
+                _ ->
+                    {N, [Pid | Acc], Retiring, Times}
+            end
+        end, {Overflow, [], [], Idle}, queue:to_list(Workers)),
+    NewWorkers = queue:from_list(lists:reverse(Kept)),
+    start_reaper(lists:reverse(Expired), State#state{workers = NewWorkers, idle_since = NewIdle}).
+
+start_reaper([], State) ->
+    State;
+start_reaper(Workers, State = #state{supervisor = Sup}) ->
+    Pool = self(),
+    Reaper = spawn_opt(fun() ->
+        lists:foreach(fun(Pid) ->
+            ok = supervisor:terminate_child(Sup, Pid),
+            Pool ! {overflow_reaped, self(), Pid},
+            receive {reap_next, Pool} -> ok end
+        end, Workers)
+    end, [link, monitor]),
+    State#state{reaper = Reaper}.

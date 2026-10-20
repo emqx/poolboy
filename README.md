@@ -153,6 +153,24 @@ code_change(_OldVsn, State, _Extra) ->
 - `worker_module`: the module that represents the workers
 - `size`: maximum pool size
 - `max_overflow`: maximum number of workers created if pool is empty
+- `overflow_ttl`: idle time in milliseconds before excess workers may be removed.
+  Defaults to `0`, which removes excess workers immediately on check-in when
+  nobody is waiting. A positive value retains idle workers for reuse; checked-out
+  workers are never reaped, and the pool never shrinks below `size`.
+- `overflow_check_period`: interval in milliseconds between idle-worker
+  checks. A value of `0` selects the default interval. Defaults to the smaller
+  of `overflow_ttl` and 1000 milliseconds when TTL is enabled. TTL is the minimum
+  idle age for reaping, not an upper bound on retention. Checks and shutdowns may
+  be delayed by scheduling or an earlier batch of slow-closing workers.
+  The timer runs only while there are idle workers and excess capacity to reap,
+  and pauses while a shutdown batch is in progress. This option has no effect
+  when `overflow_ttl` is `0`.
+  Expired workers are closed by a background process so slow shutdowns do not
+  block borrowing an available worker. Closing workers still count toward
+  `max_overflow` until they have terminated. While the supervisor is closing a
+  worker, creation and replacement are deferred. Blocking checkouts can still
+  receive returned workers. If none are available, non-blocking checkouts return
+  `full` and pool status reports `full`, even if there is spare overflow capacity.
 - `strategy`: `lifo` or `fifo`, determines whether checked in workers should be
   placed first or last in the line of available workers. So, `lifo` operates like a traditional stack; `fifo` like a queue. Default is `lifo`.
 

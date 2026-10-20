@@ -546,5 +546,14 @@ new_pool(Size, MaxOverflow, Strategy) ->
                         {size, Size}, {max_overflow, MaxOverflow},
                         {strategy, Strategy}]).
 
+pool_call(ServerRef, stop) ->
+    Ref = erlang:monitor(process, ServerRef),
+    Result = try gen_server:call(ServerRef, stop)
+             catch exit:{normal, _} -> ok;
+                   exit:{noproc, _} -> ok
+             end,
+    receive {'DOWN', Ref, process, _, _} -> Result
+    after 5000 -> erlang:demonitor(Ref, [flush]), error(stop_timeout)
+    end;
 pool_call(ServerRef, Request) ->
     gen_server:call(ServerRef, Request).
